@@ -1,17 +1,17 @@
 package app
 
 import (
-	"github.com/LyricTian/gin-admin/internal/app/config"
-	"github.com/LyricTian/gin-admin/pkg/auth"
-	"github.com/LyricTian/gin-admin/pkg/auth/jwtauth"
-	"github.com/LyricTian/gin-admin/pkg/auth/jwtauth/store/buntdb"
-	"github.com/LyricTian/gin-admin/pkg/auth/jwtauth/store/redis"
+	"github.com/LyricTian/gin-admin/v7/internal/app/config"
+	"github.com/LyricTian/gin-admin/v7/pkg/auth"
+	"github.com/LyricTian/gin-admin/v7/pkg/auth/jwtauth"
+	"github.com/LyricTian/gin-admin/v7/pkg/auth/jwtauth/store/buntdb"
+	"github.com/LyricTian/gin-admin/v7/pkg/auth/jwtauth/store/redis"
 	jwt "github.com/dgrijalva/jwt-go"
 )
 
 // InitAuth 初始化用户认证
-func InitAuth() (auth.Auther, error) {
-	cfg := config.Global().JWTAuth
+func InitAuth() (auth.Auther, func(), error) {
+	cfg := config.C.JWTAuth
 
 	var opts []jwtauth.Option
 	opts = append(opts, jwtauth.SetExpired(cfg.Expired))
@@ -37,7 +37,7 @@ func InitAuth() (auth.Auther, error) {
 	var store jwtauth.Storer
 	switch cfg.Store {
 	case "redis":
-		rcfg := config.Global().Redis
+		rcfg := config.C.Redis
 		store = redis.NewStore(&redis.Config{
 			Addr:      rcfg.Addr,
 			Password:  rcfg.Password,
@@ -47,10 +47,14 @@ func InitAuth() (auth.Auther, error) {
 	default:
 		s, err := buntdb.NewStore(cfg.FilePath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		store = s
 	}
 
-	return jwtauth.New(store, opts...), nil
+	auth := jwtauth.New(store, opts...)
+	cleanFunc := func() {
+		auth.Release()
+	}
+	return auth, cleanFunc, nil
 }

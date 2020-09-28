@@ -2,21 +2,30 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/LyricTian/gin-admin/internal/app/bll/impl"
-	"github.com/LyricTian/gin-admin/internal/app/config"
-	"github.com/LyricTian/gin-admin/pkg/auth"
-	"github.com/LyricTian/gin-admin/pkg/logger"
-	"go.uber.org/dig"
+	"github.com/LyricTian/captcha"
+	"github.com/LyricTian/captcha/store"
+	"github.com/LyricTian/gin-admin/v7/internal/app/config"
+	"github.com/LyricTian/gin-admin/v7/pkg/logger"
+	"github.com/go-redis/redis"
+	"github.com/google/gops/agent"
+
+	// 引入swagger
+	_ "github.com/LyricTian/gin-admin/v7/internal/app/swagger"
 )
 
 type options struct {
 	ConfigFile string
 	ModelFile  string
-	WWWDir     string
-	SwaggerDir string
 	MenuFile   string
+	WWWDir     string
 	Version    string
 }
 
@@ -44,13 +53,6 @@ func SetWWWDir(s string) Option {
 	}
 }
 
-// SetSwaggerDir 设定swagger目录
-func SetSwaggerDir(s string) Option {
-	return func(o *options) {
-		o.SwaggerDir = s
-	}
-}
-
 // SetMenuFile 设定菜单数据文件
 func SetMenuFile(s string) Option {
 	return func(o *options) {
@@ -65,108 +67,159 @@ func SetVersion(s string) Option {
 	}
 }
 
-func handleError(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
-
 // Init 应用初始化
-func Init(ctx context.Context, opts ...Option) func() {
+func Init(ctx context.Context, opts ...Option) (func(), error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	err := config.LoadGlobal(o.ConfigFile)
-	handleError(err)
 
-	cfg := config.Global()
-
-	logger.Printf(ctx, "服务启动，运行模式：%s，版本号：%s，进程号：%d", cfg.RunMode, o.Version, os.Getpid())
-
+	config.MustLoad(o.ConfigFile)
 	if v := o.ModelFile; v != "" {
-		cfg.Casbin.Model = v
+		config.C.Casbin.Model = v
 	}
 	if v := o.WWWDir; v != "" {
-		cfg.WWW = v
-	}
-	if v := o.SwaggerDir; v != "" {
-		cfg.Swagger = v
+		config.C.WWW = v
 	}
 	if v := o.MenuFile; v != "" {
-		cfg.Menu.Data = v
+		config.C.Menu.Data = v
 	}
+	config.PrintWithJSON()
 
-	loggerCall, err := InitLogger()
-	handleError(err)
+	logger.WithContext(ctx).Printf("服务启动，运行模式：%s，版本号：%s，进程号：%d", config.C.RunMode, o.Version, os.Getpid())
 
-	err = InitMonitor()
+	// 初始化日志模块
+	loggerCleanFunc, err := InitLogger()
 	if err != nil {
-		logger.Errorf(ctx, err.Error())
+		return nil, err
 	}
+
+	// 初始化服务运行监控
+	monitorCleanFunc := InitMonitor(ctx)
 
 	// 初始化图形验证码
 	InitCaptcha()
 
-	// 创建依赖注入容器
-	container, containerCall := BuildContainer()
+	// 初始化依赖注入器
+	injector, injectorCleanFunc, err := BuildInjector()
+	if err != nil {
+		return nil, err
+	}
 
-	// 初始化数据
-	err = InitData(ctx, container)
-	handleError(err)
+	// 初始化菜单数据
+	if config.C.Menu.Enable && config.C.Menu.Data != "" {
+		err = injector.MenuBll.InitData(ctx, config.C.Menu.Data)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// 初始化HTTP服务
-	httpCall := InitHTTPServer(ctx, container)
+	httpServerCleanFunc := InitHTTPServer(ctx, injector.Engine)
+
 	return func() {
-		if httpCall != nil {
-			httpCall()
+		httpServerCleanFunc()
+		injectorCleanFunc()
+		monitorCleanFunc()
+		loggerCleanFunc()
+	}, nil
+}
+
+// InitCaptcha 初始化图形验证码
+func InitCaptcha() {
+	cfg := config.C.Captcha
+	if cfg.Store == "redis" {
+		rc := config.C.Redis
+		captcha.SetCustomStore(store.NewRedisStore(&redis.Options{
+			Addr:     rc.Addr,
+			Password: rc.Password,
+			DB:       cfg.RedisDB,
+		}, captcha.Expiration, logger.StandardLogger(), cfg.RedisPrefix))
+	}
+}
+
+// InitMonitor 初始化服务监控
+func InitMonitor(ctx context.Context) func() {
+	if c := config.C.Monitor; c.Enable {
+		// ShutdownCleanup set false to prevent automatically closes on os.Interrupt
+		// and close agent manually before service shutting down
+		err := agent.Listen(agent.Options{Addr: c.Addr, ConfigDir: c.ConfigDir, ShutdownCleanup: false})
+		if err != nil {
+			logger.WithContext(ctx).Errorf("Agent monitor error: %s", err.Error())
 		}
-		if containerCall != nil {
-			containerCall()
+		return func() {
+			agent.Close()
 		}
-		if loggerCall != nil {
-			loggerCall()
+	}
+	return func() {}
+}
+
+// InitHTTPServer 初始化http服务
+func InitHTTPServer(ctx context.Context, handler http.Handler) func() {
+	cfg := config.C.HTTP
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  15 * time.Second,
+	}
+
+	go func() {
+		logger.WithContext(ctx).Printf("HTTP server is running at %s.", addr)
+
+		var err error
+		if cfg.CertFile != "" && cfg.KeyFile != "" {
+			srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+			err = srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			panic(err)
+		}
+
+	}()
+
+	return func() {
+		ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(cfg.ShutdownTimeout))
+		defer cancel()
+
+		srv.SetKeepAlivesEnabled(false)
+		if err := srv.Shutdown(ctx); err != nil {
+			logger.WithContext(ctx).Errorf(err.Error())
 		}
 	}
 }
 
-// BuildContainer 创建依赖注入容器
-func BuildContainer() (*dig.Container, func()) {
-	// 创建依赖注入容器
-	container := dig.New()
+// Run 运行服务
+func Run(ctx context.Context, opts ...Option) error {
+	state := 1
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	cleanFunc, err := Init(ctx, opts...)
+	if err != nil {
+		return err
+	}
 
-	// 注入认证模块
-	auther, err := InitAuth()
-	handleError(err)
-	_ = container.Provide(func() auth.Auther {
-		return auther
-	})
-
-	// 注入casbin
-	_ = container.Provide(NewCasbinEnforcer)
-
-	// 注入存储模块
-	storeCall, err := InitStore(container)
-	handleError(err)
-
-	// 注入bll
-	err = impl.Inject(container)
-	handleError(err)
-
-	// 初始化casbin
-	err = InitCasbinEnforcer(container)
-	handleError(err)
-
-	return container, func() {
-		if auther != nil {
-			_ = auther.Release()
-		}
-
-		// 释放资源
-		ReleaseCasbinEnforcer(container)
-
-		if storeCall != nil {
-			storeCall()
+EXIT:
+	for {
+		sig := <-sc
+		logger.WithContext(ctx).Infof("接收到信号[%s]", sig.String())
+		switch sig {
+		case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
+			state = 0
+			break EXIT
+		case syscall.SIGHUP:
+		default:
+			break EXIT
 		}
 	}
+
+	cleanFunc()
+	logger.WithContext(ctx).Infof("服务退出")
+	time.Sleep(time.Second)
+	os.Exit(state)
+	return nil
 }

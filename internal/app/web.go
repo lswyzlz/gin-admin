@@ -1,95 +1,62 @@
 package app
 
 import (
-	"context"
-	"crypto/tls"
-	"fmt"
-	"net/http"
-	"time"
-
-	"github.com/LyricTian/gin-admin/internal/app/config"
-	"github.com/LyricTian/gin-admin/internal/app/middleware"
-	"github.com/LyricTian/gin-admin/internal/app/routers/api"
-	"github.com/LyricTian/gin-admin/pkg/logger"
+	"github.com/LyricTian/gin-admin/v7/internal/app/config"
+	"github.com/LyricTian/gin-admin/v7/internal/app/middleware"
+	"github.com/LyricTian/gin-admin/v7/internal/app/router"
+	"github.com/LyricTian/gzip"
 	"github.com/gin-gonic/gin"
-	"go.uber.org/dig"
+	ginSwagger "github.com/swaggo/gin-swagger"
+	swaggerFiles "github.com/swaggo/gin-swagger/swaggerFiles"
 )
 
-// InitWeb 初始化web引擎
-func InitWeb(container *dig.Container) *gin.Engine {
-	cfg := config.Global()
-	gin.SetMode(cfg.RunMode)
+// InitGinEngine 初始化gin引擎
+func InitGinEngine(r router.IRouter) *gin.Engine {
+	gin.SetMode(config.C.RunMode)
 
 	app := gin.New()
 	app.NoMethod(middleware.NoMethodHandler())
 	app.NoRoute(middleware.NoRouteHandler())
 
-	apiPrefixes := []string{"/api/"}
+	prefixes := r.Prefixes()
 
-	// 跟踪ID
-	app.Use(middleware.TraceMiddleware(middleware.AllowPathPrefixNoSkipper(apiPrefixes...)))
+	// Trace ID
+	app.Use(middleware.TraceMiddleware(middleware.AllowPathPrefixNoSkipper(prefixes...)))
 
-	// 访问日志
-	app.Use(middleware.LoggerMiddleware(middleware.AllowPathPrefixNoSkipper(apiPrefixes...)))
+	// Copy body
+	app.Use(middleware.CopyBodyMiddleware(middleware.AllowPathPrefixNoSkipper(prefixes...)))
 
-	// 崩溃恢复
+	// Access logger
+	app.Use(middleware.LoggerMiddleware(middleware.AllowPathPrefixNoSkipper(prefixes...)))
+
+	// Recover
 	app.Use(middleware.RecoveryMiddleware())
 
-	// 跨域请求
-	if cfg.CORS.Enable {
+	// CORS
+	if config.C.CORS.Enable {
 		app.Use(middleware.CORSMiddleware())
 	}
 
-	// 注册/api路由
-	err := api.RegisterRouter(app, container)
-	handleError(err)
-
-	// swagger文档
-	if dir := cfg.Swagger; dir != "" {
-		app.Static("/swagger", dir)
+	// GZIP
+	if config.C.GZIP.Enable {
+		app.Use(gzip.Gzip(gzip.BestCompression,
+			gzip.WithExcludedExtensions(config.C.GZIP.ExcludedExtentions),
+			gzip.WithExcludedPaths(config.C.GZIP.ExcludedPaths),
+		))
 	}
 
-	// 静态站点
-	if dir := cfg.WWW; dir != "" {
-		app.Use(middleware.WWWMiddleware(dir))
+	// Router register
+	r.Register(app)
+
+	// Swagger
+	if config.C.Swagger {
+		app.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	}
+
+	// Website
+	if dir := config.C.WWW; dir != "" {
+		app.Use(middleware.WWWMiddleware(dir, middleware.AllowPathPrefixSkipper(prefixes...)))
 	}
 
 	return app
-}
-
-// InitHTTPServer 初始化http服务
-func InitHTTPServer(ctx context.Context, container *dig.Container) func() {
-	cfg := config.Global().HTTP
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      InitWeb(container),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  15 * time.Second,
-	}
-
-	go func() {
-		logger.Printf(ctx, "HTTP服务开始启动，地址监听在：[%s]", addr)
-		var err error
-		if cfg.CertFile != "" && cfg.KeyFile != "" {
-			srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-			err = srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
-		} else {
-			err = srv.ListenAndServe()
-		}
-		if err != nil && err != http.ErrServerClosed {
-			logger.Errorf(ctx, err.Error())
-		}
-	}()
-
-	return func() {
-		ctx, cancel := context.WithTimeout(ctx, time.Second*time.Duration(cfg.ShutdownTimeout))
-		defer cancel()
-
-		srv.SetKeepAlivesEnabled(false)
-		if err := srv.Shutdown(ctx); err != nil {
-			logger.Errorf(ctx, err.Error())
-		}
-	}
 }

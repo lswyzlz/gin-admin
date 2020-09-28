@@ -5,15 +5,16 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/LyricTian/gin-admin/internal/app/config"
-	"github.com/LyricTian/gin-admin/pkg/logger"
-	loggerhook "github.com/LyricTian/gin-admin/pkg/logger/hook"
-	loggergormhook "github.com/LyricTian/gin-admin/pkg/logger/hook/gorm"
+	"github.com/LyricTian/gin-admin/v7/internal/app/config"
+	"github.com/LyricTian/gin-admin/v7/pkg/logger"
+	loggerhook "github.com/LyricTian/gin-admin/v7/pkg/logger/hook"
+	loggergormhook "github.com/LyricTian/gin-admin/v7/pkg/logger/hook/gorm"
+	"github.com/sirupsen/logrus"
 )
 
-// InitLogger 初始化日志
+// InitLogger 初始化日志模块
 func InitLogger() (func(), error) {
-	c := config.Global().Log
+	c := config.C.Log
 	logger.SetLevel(c.Level)
 	logger.SetFormatter(c.Format)
 
@@ -41,18 +42,27 @@ func InitLogger() (func(), error) {
 
 	var hook *loggerhook.Hook
 	if c.EnableHook {
-		switch c.Hook {
-		case "gorm":
-			hc := config.Global().LogGormHook
+		var hookLevels []logrus.Level
+		for _, lvl := range c.HookLevels {
+			plvl, err := logrus.ParseLevel(lvl)
+			if err != nil {
+				return nil, err
+			}
+			hookLevels = append(hookLevels, plvl)
+		}
+
+		switch {
+		case c.Hook.IsGorm():
+			hc := config.C.LogGormHook
 
 			var dsn string
 			switch hc.DBType {
 			case "mysql":
-				dsn = config.Global().MySQL.DSN()
+				dsn = config.C.MySQL.DSN()
 			case "sqlite3":
-				dsn = config.Global().Sqlite3.DSN()
+				dsn = config.C.Sqlite3.DSN()
 			case "postgres":
-				dsn = config.Global().Postgres.DSN()
+				dsn = config.C.Postgres.DSN()
 			default:
 				return nil, errors.New("unknown db")
 			}
@@ -67,6 +77,7 @@ func InitLogger() (func(), error) {
 			}),
 				loggerhook.SetMaxWorkers(c.HookMaxThread),
 				loggerhook.SetMaxQueues(c.HookMaxBuffer),
+				loggerhook.SetLevels(hookLevels...),
 			)
 			logger.AddHook(h)
 			hook = h

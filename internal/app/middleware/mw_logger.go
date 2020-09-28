@@ -1,14 +1,13 @@
 package middleware
 
 import (
-	"bytes"
-	"io/ioutil"
 	"mime"
 	"net/http"
 	"time"
 
-	"github.com/LyricTian/gin-admin/internal/app/ginplus"
-	"github.com/LyricTian/gin-admin/pkg/logger"
+	"github.com/LyricTian/gin-admin/v7/internal/app/config"
+	"github.com/LyricTian/gin-admin/v7/internal/app/ginx"
+	"github.com/LyricTian/gin-admin/v7/pkg/logger"
 	"github.com/gin-gonic/gin"
 )
 
@@ -22,12 +21,10 @@ func LoggerMiddleware(skippers ...SkipperFunc) gin.HandlerFunc {
 
 		p := c.Request.URL.Path
 		method := c.Request.Method
-		span := logger.StartSpan(ginplus.NewContext(c),
-			logger.SetSpanTitle("访问日志"),
-			logger.SetSpanFuncName(JoinRouter(method, p)))
+
+		entry := logger.WithContext(logger.NewTagContext(c.Request.Context(), "__request__"))
 
 		start := time.Now()
-
 		fields := make(map[string]interface{})
 		fields["ip"] = c.ClientIP()
 		fields["method"] = method
@@ -35,18 +32,15 @@ func LoggerMiddleware(skippers ...SkipperFunc) gin.HandlerFunc {
 		fields["proto"] = c.Request.Proto
 		fields["header"] = c.Request.Header
 		fields["user_agent"] = c.GetHeader("User-Agent")
+		fields["content_length"] = c.Request.ContentLength
 
-		// 如果是POST/PUT请求，并且内容类型为JSON，则读取内容体
 		if method == http.MethodPost || method == http.MethodPut {
 			mediaType, _, _ := mime.ParseMediaType(c.GetHeader("Content-Type"))
-			if mediaType == "application/json" {
-				body, err := ioutil.ReadAll(c.Request.Body)
-				c.Request.Body.Close()
-				if err == nil {
-					buf := bytes.NewBuffer(body)
-					c.Request.Body = ioutil.NopCloser(buf)
-					fields["content_length"] = c.Request.ContentLength
-					fields["body"] = string(body)
+			if mediaType != "multipart/form-data" {
+				if v, ok := c.Get(ginx.ReqBodyKey); ok {
+					if b, ok := v.([]byte); ok && len(b) <= config.C.HTTP.MaxLoggerLength {
+						fields["body"] = string(b)
+					}
 				}
 			}
 		}
@@ -56,14 +50,20 @@ func LoggerMiddleware(skippers ...SkipperFunc) gin.HandlerFunc {
 		fields["res_status"] = c.Writer.Status()
 		fields["res_length"] = c.Writer.Size()
 
-		if v, ok := c.Get(ginplus.ResBodyKey); ok {
-			if b, ok := v.([]byte); ok {
+		if v, ok := c.Get(ginx.LoggerReqBodyKey); ok {
+			if b, ok := v.([]byte); ok && len(b) <= config.C.HTTP.MaxLoggerLength {
+				fields["body"] = string(b)
+			}
+		}
+
+		if v, ok := c.Get(ginx.ResBodyKey); ok {
+			if b, ok := v.([]byte); ok && len(b) <= config.C.HTTP.MaxLoggerLength {
 				fields["res_body"] = string(b)
 			}
 		}
 
-		fields[logger.UserIDKey] = ginplus.GetUserID(c)
-		span.WithFields(fields).Infof("[http] %s-%s-%s-%d(%dms)",
+		fields[logger.UserIDKey] = ginx.GetUserID(c)
+		entry.WithFields(fields).Infof("[http] %s-%s-%s-%d(%dms)",
 			p, c.Request.Method, c.ClientIP(), c.Writer.Status(), timeConsuming)
 	}
 }
